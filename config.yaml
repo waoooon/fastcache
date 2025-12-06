@@ -1,0 +1,38 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  admin_port: 9090  # Health check endpoint
+  socket: "/tmp/fastcache.sock"
+
+cache:
+  max_capacity: 10000
+  default_ttl: 3600
+
+# Rate limiting (per IP)
+rate_limit:
+  requests_per_second: 100
+  burst_size: 50
+
+# TLS configuration (optional)
+# tls:
+#   cert_path: "/path/to/cert.pem"
+#   key_path: "/path/to/key.pem"
+
+origins:
+  # Local file serving (static files)
+  - path: "/static"
+    type: local
+    root: "./public"
+    cache_ttl: 86400  # 1 day
+
+  # Remote origin (API, etc.)
+  # - path: "/api"
+  #   type: remote
+  #   url: "http://localhost:3000"
+  #   cache_ttl: 0  # No cache
+
+  # Default remote origin
+  # - path: "/"
+  #   type: remote
+  #   url: "http://origin.example.com"
+  #   cache_ttl: 3600

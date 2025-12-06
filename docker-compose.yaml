@@ -1,0 +1,9 @@
+services:
+  cdn:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+      - ./public:/app/public:ro
+    restart: unless-stopped
