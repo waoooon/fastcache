@@ -9,10 +9,10 @@ release:
 
 # Run
 run:
-	cargo run -- serve
+	RUST_LOG=info,access_log=info cargo run -- serve
 
 dev:
-	cargo run -- serve --config config.yaml
+	RUST_LOG=info,access_log=info cargo run -- serve --config config.yaml
 
 # Cache management
 purge-all:

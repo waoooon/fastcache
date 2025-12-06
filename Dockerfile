@@ -40,7 +40,7 @@ RUN mkdir -p /app/public /app/config
 # Default config
 COPY config.yaml /app/config/config.yaml
 
-EXPOSE 8080
+EXPOSE 8080 8443 9090
 
 ENTRYPOINT ["app"]
 CMD ["serve", "--config", "/app/config/config.yaml"]

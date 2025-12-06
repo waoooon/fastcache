@@ -2,14 +2,15 @@ use crate::application::cdn_service::CdnService;
 use crate::domain::cache::CdnCache;
 use crate::domain::origin::Origin;
 use crate::domain::route::{OriginEntry, Route, Router};
-use std::collections::HashMap;
-use crate::infrastructure::config::{Config, OriginConfig};
+use crate::infrastructure::config::{Config, OriginConfig, TlsConfig};
 use crate::infrastructure::origin::local::LocalOrigin;
 use crate::infrastructure::origin::remote::RemoteOrigin;
 use crate::presentation::admin::socket_server;
 use crate::presentation::http::handler::{handle_request, health_check};
 use crate::presentation::http::middleware::access_log;
 use axum::{middleware, routing::any, routing::get, Router as AxumRouter};
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +24,50 @@ async fn start_admin_http_server(addr: SocketAddr) -> anyhow::Result<()> {
     info!("Admin server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, admin_app).await?;
+    Ok(())
+}
+
+async fn start_cdn_server(
+    addr: SocketAddr,
+    tls_config: Option<&TlsConfig>,
+    cdn_app: AxumRouter<()>,
+) -> anyhow::Result<()> {
+    match tls_config {
+        Some(tls) => {
+            info!("CDN server listening on https://{}", addr);
+            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                &tls.cert_path,
+                &tls.key_path,
+            )
+            .await?;
+            axum_server::bind_rustls(addr, rustls_config)
+                .serve(cdn_app.into_make_service_with_connect_info::<SocketAddr>())
+                .await?;
+        }
+        None => {
+            info!("CDN server listening on http://{}", addr);
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            axum::serve(
+                listener,
+                cdn_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_servers<F: Future<Output = anyhow::Result<()>>>(
+    cdn_server: F,
+    admin_addr: SocketAddr,
+    socket_path: &str,
+    cache: CdnCache,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        result = cdn_server => result?,
+        result = start_admin_http_server(admin_addr) => result?,
+        result = socket_server::start_admin_server(socket_path, cache) => result?,
+    }
     Ok(())
 }
 
@@ -64,52 +109,13 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> anyhow::Result<()> {
         format!("{}:{}", config.server.host, config.server.admin_port).parse()?;
     let socket_path = config.server.socket.clone();
 
-    match &config.tls {
-        Some(tls_config) => {
-            info!("CDN server listening on https://{}", cdn_addr);
-
-            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &tls_config.cert_path,
-                &tls_config.key_path,
-            )
-            .await?;
-
-            tokio::select! {
-                result = axum_server::bind_rustls(cdn_addr, rustls_config)
-                    .serve(cdn_app.into_make_service_with_connect_info::<SocketAddr>()) => {
-                    result?;
-                }
-                result = start_admin_http_server(admin_addr) => {
-                    result?;
-                }
-                result = socket_server::start_admin_server(&socket_path, cache) => {
-                    result?;
-                }
-            }
-        }
-        None => {
-            info!("CDN server listening on http://{}", cdn_addr);
-
-            let cdn_listener = tokio::net::TcpListener::bind(&cdn_addr).await?;
-
-            tokio::select! {
-                result = axum::serve(
-                    cdn_listener,
-                    cdn_app.into_make_service_with_connect_info::<SocketAddr>()
-                ) => {
-                    result?;
-                }
-                result = start_admin_http_server(admin_addr) => {
-                    result?;
-                }
-                result = socket_server::start_admin_server(&socket_path, cache) => {
-                    result?;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    run_servers(
+        start_cdn_server(cdn_addr, config.tls.as_ref(), cdn_app),
+        admin_addr,
+        &socket_path,
+        cache,
+    )
+    .await
 }
 
 fn build_router(origins: &[OriginConfig]) -> Router {
