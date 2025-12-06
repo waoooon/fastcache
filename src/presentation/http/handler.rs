@@ -141,3 +141,119 @@ fn build_forwarded_response(origin_response: &OriginResponse) -> Response {
         .body(Body::from(origin_response.body.clone()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let response = health_check().await;
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn test_build_cached_response_hit() {
+        let cached = CachedResponse {
+            body: Bytes::from("test body"),
+            content_type: "text/plain".to_string(),
+            etag: "abc123".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let response = build_cached_response(&cached, true);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_X_CACHE).unwrap(),
+            "HIT"
+        );
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            "\"abc123\""
+        );
+    }
+
+    #[test]
+    fn test_build_cached_response_miss() {
+        let cached = CachedResponse {
+            body: Bytes::from("test body"),
+            content_type: "text/plain".to_string(),
+            etag: "abc123".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let response = build_cached_response(&cached, false);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_X_CACHE).unwrap(),
+            "MISS"
+        );
+    }
+
+    #[test]
+    fn test_build_cached_response_with_extra_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("Cache-Control".to_string(), "max-age=3600".to_string());
+        headers.insert("Last-Modified".to_string(), "Wed, 21 Oct 2015".to_string());
+
+        let cached = CachedResponse {
+            body: Bytes::from("test body"),
+            content_type: "text/plain".to_string(),
+            etag: "abc123".to_string(),
+            headers,
+        };
+
+        let response = build_cached_response(&cached, true);
+        assert_eq!(
+            response.headers().get("Cache-Control").unwrap(),
+            "max-age=3600"
+        );
+        assert_eq!(
+            response.headers().get("Last-Modified").unwrap(),
+            "Wed, 21 Oct 2015"
+        );
+    }
+
+    #[test]
+    fn test_build_forwarded_response() {
+        let origin_response = OriginResponse {
+            body: Bytes::from("forwarded body"),
+            content_type: "application/json".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let response = build_forwarded_response(&origin_response);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_build_forwarded_response_with_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Custom".to_string(), "value".to_string());
+        // content-type in headers should be skipped (already set explicitly)
+        headers.insert("Content-Type".to_string(), "text/html".to_string());
+
+        let origin_response = OriginResponse {
+            body: Bytes::from("body"),
+            content_type: "application/json".to_string(),
+            headers,
+        };
+
+        let response = build_forwarded_response(&origin_response);
+        assert_eq!(
+            response.headers().get("X-Custom").unwrap(),
+            "value"
+        );
+        // Should use the explicit content_type, not the one in headers
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+}

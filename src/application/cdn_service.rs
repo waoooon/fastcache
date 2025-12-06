@@ -337,4 +337,209 @@ mod tests {
             _ => panic!("Expected NotFound result"),
         }
     }
+
+    #[tokio::test]
+    async fn test_post_request_forwarded_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/api".to_string(),
+            origins: vec![OriginEntry {
+                origin: Arc::new(SuccessOrigin {
+                    name: "api".to_string(),
+                    call_count: call_count.clone(),
+                }),
+                cache_ttl: 3600, // Would cache if GET
+            }],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        // POST request
+        let result = service
+            .handle_request(
+                Method::POST,
+                "/api/data",
+                Some(Bytes::from("request body")),
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+        // Origin should be called
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Should return Forwarded (not Fresh/Cached)
+        match result {
+            FetchResult::Forwarded(response) => {
+                assert_eq!(response.body, Bytes::from("from api"));
+            }
+            _ => panic!("Expected Forwarded result"),
+        }
+
+        // Cache should be empty (POST not cached)
+        assert!(service.cache.get("/api/data").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_put_request_forwarded_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/api".to_string(),
+            origins: vec![OriginEntry {
+                origin: Arc::new(SuccessOrigin {
+                    name: "api".to_string(),
+                    call_count: call_count.clone(),
+                }),
+                cache_ttl: 3600,
+            }],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        // PUT request
+        let result = service
+            .handle_request(Method::PUT, "/api/resource", None, HashMap::new(), None)
+            .await;
+
+        // Origin should be called
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Should return Forwarded
+        assert!(matches!(result, FetchResult::Forwarded(_)));
+
+        // Cache should be empty
+        assert!(service.cache.get("/api/resource").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_request_forwarded_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/api".to_string(),
+            origins: vec![OriginEntry {
+                origin: Arc::new(SuccessOrigin {
+                    name: "api".to_string(),
+                    call_count: call_count.clone(),
+                }),
+                cache_ttl: 3600,
+            }],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        // DELETE request
+        let result = service
+            .handle_request(Method::DELETE, "/api/resource/123", None, HashMap::new(), None)
+            .await;
+
+        // Origin should be called
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Should return Forwarded
+        assert!(matches!(result, FetchResult::Forwarded(_)));
+
+        // Cache should be empty
+        assert!(service.cache.get("/api/resource/123").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_patch_request_forwarded_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/api".to_string(),
+            origins: vec![OriginEntry {
+                origin: Arc::new(SuccessOrigin {
+                    name: "api".to_string(),
+                    call_count: call_count.clone(),
+                }),
+                cache_ttl: 3600,
+            }],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        // PATCH request
+        let result = service
+            .handle_request(
+                Method::PATCH,
+                "/api/resource",
+                Some(Bytes::from("partial update")),
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+        // Origin should be called
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Should return Forwarded
+        assert!(matches!(result, FetchResult::Forwarded(_)));
+
+        // Cache should be empty
+        assert!(service.cache.get("/api/resource").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_but_post_not_cached() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/api".to_string(),
+            origins: vec![OriginEntry {
+                origin: Arc::new(SuccessOrigin {
+                    name: "api".to_string(),
+                    call_count: call_count.clone(),
+                }),
+                cache_ttl: 3600,
+            }],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        // First: GET request - should be cached
+        let result = service
+            .handle_request(Method::GET, "/api/data", None, HashMap::new(), None)
+            .await;
+        assert!(matches!(result, FetchResult::Fresh(_)));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Verify GET result is cached
+        assert!(service.cache.get("/api/data").await.is_some());
+
+        // Second: GET request - should hit cache
+        let result = service
+            .handle_request(Method::GET, "/api/data", None, HashMap::new(), None)
+            .await;
+        assert!(matches!(result, FetchResult::Cached(_)));
+        // Origin not called again
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Third: POST request - should forward, not use cache
+        let result = service
+            .handle_request(
+                Method::POST,
+                "/api/data",
+                Some(Bytes::from("body")),
+                HashMap::new(),
+                None,
+            )
+            .await;
+        assert!(matches!(result, FetchResult::Forwarded(_)));
+        // Origin called for POST
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
 }
