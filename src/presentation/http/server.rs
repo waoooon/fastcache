@@ -6,7 +6,7 @@ use crate::infrastructure::config::{Config, OriginConfig, TlsConfig};
 use crate::infrastructure::origin::local::LocalOrigin;
 use crate::infrastructure::origin::remote::RemoteOrigin;
 use crate::presentation::admin::socket_server;
-use crate::presentation::http::handler::{handle_request, health_check};
+use crate::presentation::http::handler::{handle_request, health_check, AppState};
 use crate::presentation::http::middleware::access_log;
 use axum::{middleware, routing::any, routing::get, Router as AxumRouter};
 use std::collections::HashMap;
@@ -35,11 +35,9 @@ async fn start_cdn_server(
     match tls_config {
         Some(tls) => {
             info!("CDN server listening on https://{}", addr);
-            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &tls.cert_path,
-                &tls.key_path,
-            )
-            .await?;
+            let rustls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                    .await?;
             axum_server::bind_rustls(addr, rustls_config)
                 .serve(cdn_app.into_make_service_with_connect_info::<SocketAddr>())
                 .await?;
@@ -86,6 +84,11 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> anyhow::Result<()> {
 
     let cdn_service = Arc::new(CdnService::new(router, cache.clone()));
 
+    let app_state = AppState {
+        cdn_service,
+        max_body_size: config.server.max_body_size,
+    };
+
     // Rate limiter configuration
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
@@ -102,7 +105,7 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> anyhow::Result<()> {
             config: governor_conf,
         })
         .layer(CompressionLayer::new())
-        .with_state(cdn_service);
+        .with_state(app_state);
 
     let cdn_addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let admin_addr: SocketAddr =

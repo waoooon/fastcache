@@ -23,6 +23,12 @@ pub struct ServerConfig {
     pub admin_port: u16,
     #[serde(default = "default_socket_path")]
     pub socket: String,
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
+}
+
+fn default_max_body_size() -> usize {
+    10 * 1024 * 1024 // 10MB
 }
 
 fn default_admin_port() -> u16 {
@@ -119,6 +125,7 @@ impl Default for Config {
                 port: 8080,
                 admin_port: default_admin_port(),
                 socket: default_socket_path(),
+                max_body_size: default_max_body_size(),
             },
             cache: CacheConfig {
                 max_capacity: 10000,

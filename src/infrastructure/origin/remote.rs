@@ -1,6 +1,7 @@
-use crate::domain::origin::{Origin, OriginResponse};
+use crate::domain::origin::{Origin, OriginRequest, OriginResponse};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use axum::http::Method;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -27,12 +28,30 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
 
 #[async_trait]
 impl Origin for RemoteOrigin {
-    async fn fetch(&self, path: &str) -> Result<OriginResponse> {
-        let url = format!("{}{}", self.base_url, path);
+    async fn fetch(&self, request: OriginRequest) -> Result<OriginResponse> {
+        let url = format!("{}{}", self.base_url, request.path);
 
-        let response = self
-            .client
-            .get(&url)
+        let mut req_builder = match request.method {
+            Method::GET => self.client.get(&url),
+            Method::POST => self.client.post(&url),
+            Method::PUT => self.client.put(&url),
+            Method::PATCH => self.client.patch(&url),
+            Method::DELETE => self.client.delete(&url),
+            Method::HEAD => self.client.head(&url),
+            _ => return Err(anyhow!("Unsupported method: {}", request.method)),
+        };
+
+        // Forward request headers
+        for (key, value) in &request.headers {
+            req_builder = req_builder.header(key.as_str(), value.as_str());
+        }
+
+        // Forward request body
+        if let Some(body) = request.body {
+            req_builder = req_builder.body(body);
+        }
+
+        let response = req_builder
             .send()
             .await
             .map_err(|e| anyhow!("Failed to fetch from origin: {}", e))?;

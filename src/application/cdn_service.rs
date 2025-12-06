@@ -1,7 +1,10 @@
 use crate::domain::cache::{CachedResponse, CdnCache};
+use crate::domain::origin::{OriginRequest, OriginResponse};
 use crate::domain::route::Router;
+use axum::http::Method;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tracing::debug;
 
 pub enum FetchResult {
@@ -9,6 +12,7 @@ pub enum FetchResult {
     Fresh(CachedResponse),
     NotModified,
     NotFound(String),
+    Forwarded(OriginResponse),
 }
 
 pub struct CdnService {
@@ -21,7 +25,21 @@ impl CdnService {
         Self { router, cache }
     }
 
-    pub async fn fetch_content(&self, path: &str, if_none_match: Option<&str>) -> FetchResult {
+    pub async fn handle_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+        headers: HashMap<String, String>,
+        if_none_match: Option<&str>,
+    ) -> FetchResult {
+        match method {
+            Method::GET | Method::HEAD => self.fetch_content_cached(path, if_none_match).await,
+            _ => self.forward_to_origin(method, path, body, headers).await,
+        }
+    }
+
+    async fn fetch_content_cached(&self, path: &str, if_none_match: Option<&str>) -> FetchResult {
         if let Some(cached) = self.cache.get(path).await {
             if etag_matches(if_none_match, &cached.etag) {
                 return FetchResult::NotModified;
@@ -39,10 +57,10 @@ impl CdnService {
             relative_path
         };
 
-        // Try each origin in order, fallback to next on failure
         let mut last_error = String::new();
         for (i, origin_entry) in route.origins.iter().enumerate() {
-            match origin_entry.origin.fetch(relative_path).await {
+            let request = OriginRequest::get(relative_path);
+            match origin_entry.origin.fetch(request).await {
                 Ok(origin_response) => {
                     let etag = generate_etag(&origin_response.body);
 
@@ -83,6 +101,51 @@ impl CdnService {
 
         FetchResult::NotFound(last_error)
     }
+
+    async fn forward_to_origin(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+        headers: HashMap<String, String>,
+    ) -> FetchResult {
+        let Some((route, relative_path)) = self.router.match_route(path) else {
+            return FetchResult::NotFound(format!("No matching route for {}", path));
+        };
+
+        let relative_path = if relative_path.is_empty() {
+            "/"
+        } else {
+            relative_path
+        };
+
+        let mut last_error = String::new();
+        for (i, origin_entry) in route.origins.iter().enumerate() {
+            let request = OriginRequest {
+                path: relative_path.to_string(),
+                method: method.clone(),
+                body: body.clone(),
+                headers: headers.clone(),
+            };
+
+            match origin_entry.origin.fetch(request).await {
+                Ok(origin_response) => {
+                    return FetchResult::Forwarded(origin_response);
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    debug!(
+                        path = path,
+                        origin_index = i,
+                        error = %e,
+                        "Origin forward failed, trying fallback"
+                    );
+                }
+            }
+        }
+
+        FetchResult::NotFound(last_error)
+    }
 }
 
 fn etag_matches(client_etag: Option<&str>, server_etag: &str) -> bool {
@@ -96,4 +159,182 @@ fn generate_etag(body: &Bytes) -> String {
     hasher.update(body);
     let result = hasher.finalize();
     hex::encode(&result[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::origin::{Origin, OriginRequest, OriginResponse};
+    use crate::domain::route::{OriginEntry, Route, Router};
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct FailingOrigin {
+        name: String,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Origin for FailingOrigin {
+        async fn fetch(&self, _request: OriginRequest) -> Result<OriginResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("{} failed", self.name))
+        }
+    }
+
+    struct SuccessOrigin {
+        name: String,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Origin for SuccessOrigin {
+        async fn fetch(&self, _request: OriginRequest) -> Result<OriginResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(OriginResponse {
+                body: Bytes::from(format!("from {}", self.name)),
+                content_type: "text/plain".to_string(),
+                headers: HashMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_order_first_succeeds() {
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/static".to_string(),
+            origins: vec![
+                OriginEntry {
+                    origin: Arc::new(SuccessOrigin {
+                        name: "first".to_string(),
+                        call_count: first_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+                OriginEntry {
+                    origin: Arc::new(SuccessOrigin {
+                        name: "second".to_string(),
+                        call_count: second_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+            ],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        let result = service
+            .handle_request(Method::GET, "/static/test.txt", None, HashMap::new(), None)
+            .await;
+
+        // First origin should be called
+        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+        // Second origin should NOT be called (first succeeded)
+        assert_eq!(second_count.load(Ordering::SeqCst), 0);
+
+        match result {
+            FetchResult::Fresh(response) => {
+                assert_eq!(response.body, Bytes::from("from first"));
+            }
+            _ => panic!("Expected Fresh result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_order_first_fails() {
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/static".to_string(),
+            origins: vec![
+                OriginEntry {
+                    origin: Arc::new(FailingOrigin {
+                        name: "first".to_string(),
+                        call_count: first_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+                OriginEntry {
+                    origin: Arc::new(SuccessOrigin {
+                        name: "second".to_string(),
+                        call_count: second_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+            ],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        let result = service
+            .handle_request(Method::GET, "/static/test.txt", None, HashMap::new(), None)
+            .await;
+
+        // First origin should be called and fail
+        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+        // Second origin should be called as fallback
+        assert_eq!(second_count.load(Ordering::SeqCst), 1);
+
+        match result {
+            FetchResult::Fresh(response) => {
+                assert_eq!(response.body, Bytes::from("from second"));
+            }
+            _ => panic!("Expected Fresh result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_all_fail() {
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+
+        let routes = vec![Route {
+            path_prefix: "/static".to_string(),
+            origins: vec![
+                OriginEntry {
+                    origin: Arc::new(FailingOrigin {
+                        name: "first".to_string(),
+                        call_count: first_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+                OriginEntry {
+                    origin: Arc::new(FailingOrigin {
+                        name: "second".to_string(),
+                        call_count: second_count.clone(),
+                    }),
+                    cache_ttl: 0,
+                },
+            ],
+        }];
+
+        let router = Router::new(routes);
+        let cache = CdnCache::new(100, 3600);
+        let service = CdnService::new(router, cache);
+
+        let result = service
+            .handle_request(Method::GET, "/static/test.txt", None, HashMap::new(), None)
+            .await;
+
+        // Both origins should be called
+        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+        assert_eq!(second_count.load(Ordering::SeqCst), 1);
+
+        match result {
+            FetchResult::NotFound(error) => {
+                assert!(error.contains("second failed"));
+            }
+            _ => panic!("Expected NotFound result"),
+        }
+    }
 }
